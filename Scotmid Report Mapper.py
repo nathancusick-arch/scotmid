@@ -23,11 +23,14 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.formula.translate import Translator
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet.table import TableFormula
 
 
-GENERATOR_VERSION = "2026.08.12.1"
+GENERATOR_VERSION = "2026.08.12.2"
 COMPANY_NAME = "Scotmid Co-operative"
 
 
@@ -122,7 +125,6 @@ FIELD_SPECS = [
     FieldSpec("receipt_time", "Please enter the 'Transaction' code:",
               "Please enter the time from the receipt:"),
     FieldSpec("comments", "Did you see or hear anything you think we or our client should know about?", [
-        "Did anything unusual occur on the audit, or do you need to clarify any detail of your report:",
         "Please use this space to explain anything unusual about your visit or to clarify any detail of your report:",
     ]),
     FieldSpec("id_confirmation", "", "Please confirm below whether or not you were asked for ID:"),
@@ -502,6 +504,37 @@ def _copy_row_style(sheet, source_row: int, target_row: int, max_column: int) ->
         target.protection = copy(source.protection)
 
 
+def _snapshot_row_style(sheet, row: int, max_column: int) -> tuple[Any, bool, list[Any]]:
+    """Capture a row's exact layout before its former position is reused."""
+    return (
+        sheet.row_dimensions[row].height,
+        sheet.row_dimensions[row].hidden,
+        [copy(sheet.cell(row, column)._style) for column in range(1, max_column + 1)],
+    )
+
+
+def _apply_row_style(sheet, row: int, snapshot: tuple[Any, bool, list[Any]]) -> None:
+    height, hidden, styles = snapshot
+    sheet.row_dimensions[row].height = height
+    sheet.row_dimensions[row].hidden = hidden
+    for column, style in enumerate(styles, 1):
+        sheet.cell(row, column)._style = copy(style)
+
+
+def _find_row(sheet, value: str, column: int = 1, start: int = 1) -> int | None:
+    wanted = _norm(value)
+    for row in range(start, sheet.max_row + 1):
+        if _norm(sheet.cell(row, column).value) == wanted:
+            return row
+    return None
+
+
+def _trim_rows(sheet, last_row: int) -> None:
+    """Remove unused formatted rows so they do not remain in client tables."""
+    if sheet.max_row > last_row:
+        sheet.delete_rows(last_row + 1, sheet.max_row - last_row)
+
+
 def _capture_formulas(sheet, row: int, start_column: int, end_column: int) -> dict[int, str]:
     return {
         column: sheet.cell(row, column).value
@@ -584,7 +617,7 @@ def extract_history(sheet, report_year: int) -> tuple[list[HistoryRecord], list[
             visit=_text(sheet.cell(row, 3).value),
             site_id=_text(sheet.cell(row, 4).value),
             name=_text(sheet.cell(row, 7).value),
-            postcode=_text(sheet.cell(row, 12).value),
+            postcode=_text(sheet.cell(row, 11).value),
             visit_date=visit_date,
             visit_time=_parse_time(sheet.cell(row, 17).value),
             result=_result(sheet.cell(row, 19).value),
@@ -699,7 +732,7 @@ def _strip_formulas(sheet) -> None:
         return
     for row in sheet.iter_rows():
         for cell in row:
-            if cell.data_type == "f" or (isinstance(cell.value, str) and cell.value.startswith("=")):
+            if cell.data_type == "f":
                 cell.value = None
 
 
@@ -715,12 +748,14 @@ def populate_summary(sheet, current: list[dict[str, Any]]) -> None:
     new_last = 7 + len(current)
     _ensure_rows(sheet, new_last, 8, 24)
     _clear_values(sheet, 8, max(old_last, new_last), 1, 24)
+    data_style = _snapshot_row_style(sheet, 8, 24)
     completed = [record for record in current if _result(record["result"])]
     sheet["B3"] = len({_normalise_code(record["store_code"]) for record in current if _normalise_code(record["store_code"])})
     sheet["B4"] = len(completed)
     passes = sum(_result(record["result"]) == "pass" for record in completed)
     sheet["B5"] = passes / len(completed) if completed else "-"
     for row, record in enumerate(current, 8):
+        _apply_row_style(sheet, row, data_style)
         visit_date = record["visit_date"]
         values = [
             record["store_code"], record["premises"], record["postcode"], visit_date,
@@ -734,6 +769,7 @@ def populate_summary(sheet, current: list[dict[str, Any]]) -> None:
         ]
         for column, value in enumerate(values, 1):
             sheet.cell(row, column).value = value
+    _trim_rows(sheet, max(7, new_last))
 
 
 def populate_historic(sheet, history: list[HistoryRecord]) -> None:
@@ -756,7 +792,13 @@ def populate_store_performance(sheet, league_sheet, hierarchy: OrderedDict[str, 
     _strip_formulas(sheet)
     _strip_formulas(league_sheet)
     stores = list(hierarchy.values())
-    total_row = 7 + len(stores)
+    old_total_row = _find_row(sheet, "Total", 1, 7) or sheet.max_row
+    store_style = _snapshot_row_style(sheet, 7, 12)
+    gap_style = _snapshot_row_style(sheet, max(7, old_total_row - 1), 12)
+    total_style = _snapshot_row_style(sheet, old_total_row, 12)
+    last_store_row = 6 + len(stores)
+    gap_row = last_store_row + 1
+    total_row = last_store_row + 2
     _ensure_rows(sheet, total_row, 7, 12)
     _clear_values(sheet, 7, max(sheet.max_row, total_row), 1, 12)
     current_by = defaultdict(list)
@@ -766,23 +808,33 @@ def populate_store_performance(sheet, league_sheet, hierarchy: OrderedDict[str, 
     for record in ytd:
         ytd_by[record.store_code].append(record)
     for row, store in enumerate(stores, 7):
+        _apply_row_style(sheet, row, store_style)
         values = [_excel_code(store.code), store.name, *_metric(current_by[store.code]), *_metric(ytd_by[store.code])]
         for column, value in enumerate(values, 1):
             sheet.cell(row, column).value = value
+    _apply_row_style(sheet, gap_row, gap_style)
+    _apply_row_style(sheet, total_row, total_style)
     total_values = ["Total", "", *_metric(current), *_metric(ytd)]
     for column, value in enumerate(total_values, 1):
         sheet.cell(total_row, column).value = value
+        font = copy(sheet.cell(total_row, column).font)
+        font.bold = True
+        sheet.cell(total_row, column).font = font
     sheet["L2"] = COMPANY_NAME
     sheet["L3"] = report_month.strftime("01/%m/%Y")
+    _trim_rows(sheet, total_row)
 
-    league_total = 5 + len(stores)
-    _ensure_rows(league_sheet, league_total, 6, 3)
-    _clear_values(league_sheet, 6, max(league_sheet.max_row, league_total), 1, 3)
+    league_last = 5 + len(stores)
+    league_style = _snapshot_row_style(league_sheet, 6, 3)
+    _ensure_rows(league_sheet, league_last, 6, 3)
+    _clear_values(league_sheet, 6, max(league_sheet.max_row, league_last), 1, 3)
     for row, store in enumerate(stores, 6):
+        _apply_row_style(league_sheet, row, league_style)
         league_sheet.cell(row, 1).value = _excel_code(store.code)
         league_sheet.cell(row, 2).value = store.name
         league_sheet.cell(row, 3).value = _metric(ytd_by[store.code])[2]
-    league_sheet.auto_filter.ref = f"A5:C{max(6, league_total)}"
+    league_sheet.auto_filter.ref = f"A5:C{max(6, league_last)}"
+    _trim_rows(league_sheet, max(5, league_last))
     return total_row
 
 
@@ -798,23 +850,34 @@ def _normalise_till(value: Any) -> str:
 def populate_self_scan(sheet, hierarchy: OrderedDict[str, Store], history: list[HistoryRecord],
                        months: list[date]) -> None:
     _strip_formulas(sheet)
-    existing_codes = []
-    for row in range(6, sheet.max_row + 1):
-        code = _normalise_code(sheet.cell(row, 1).value)
-        if not code or _norm(code).startswith("total"):
-            break
-        existing_codes.append(code)
+    table_by_name = {table.name: table for table in sheet.tables.values()}
+    right_table = table_by_name.get("Table1")
+    totals_table = table_by_name.get("Table2")
+    if right_table is None or totals_table is None:
+        raise ReportGenerationError("The Self-Scan Performance template tables are missing.")
+    _, _, _, old_right_total = range_boundaries(right_table.ref)
+    _, old_totals_start, _, old_totals_end = range_boundaries(totals_table.ref)
+    data_style = _snapshot_row_style(sheet, 6, 20)
+    right_total_style = _snapshot_row_style(sheet, old_right_total, 20)
+    blank_style = _snapshot_row_style(sheet, min(old_right_total + 1, old_totals_start - 1), 20)
+    bottom_styles = [
+        _snapshot_row_style(sheet, row, 20)
+        for row in range(old_totals_start, old_totals_end + 1)
+    ]
+
     rolling = [record for record in history if record.visit_date and months[0] <= record.visit_date.date() < _add_months(months[-1], 1)]
-    self_scan_codes = {
-        record.store_code for record in rolling if _normalise_till(record.till_type) == "Self-Scan Till"
-    }
-    codes = [code for code in existing_codes if code in hierarchy and hierarchy[code].status == "Active"]
-    codes.extend(sorted(self_scan_codes - set(codes), key=_natural_key))
-    codes = list(dict.fromkeys(codes))
+    codes = [
+        code for code, store in hierarchy.items()
+        if store.status == "Active" and "self scan till" in _norm(store.visit_info)
+    ]
+    code_set = set(codes)
     first_row = 6
-    total_start = first_row + len(codes) + 2
-    _ensure_rows(sheet, total_start + 2, 6, 20)
-    _clear_values(sheet, 4, max(sheet.max_row, total_start + 2), 1, 20)
+    last_store_row = first_row + len(codes) - 1
+    right_total_row = last_store_row + 1
+    total_start = last_store_row + 4
+    total_end = total_start + 2
+    _ensure_rows(sheet, total_end, 6, 20)
+    _clear_values(sheet, 4, max(sheet.max_row, total_end), 1, 20)
     for offset, month in enumerate(months, 3):
         month_records = _records_in_month(rolling, month)
         orders = Counter(record.order for record in month_records if record.order)
@@ -826,6 +889,7 @@ def populate_self_scan(sheet, hierarchy: OrderedDict[str, Store], history: list[
     sheet["S5"] = "Total Passes"
     sheet["T5"] = "%"
     for row, code in enumerate(codes, first_row):
+        _apply_row_style(sheet, row, data_style)
         store = hierarchy[code]
         sheet.cell(row, 1).value = _excel_code(code)
         sheet.cell(row, 2).value = store.name
@@ -839,24 +903,68 @@ def populate_self_scan(sheet, hierarchy: OrderedDict[str, Store], history: list[
                 passes += sum(_result(record.result) == "pass" for record in records)
                 value = "fail" if any(_result(record.result) == "fail" for record in records) else "P"
             sheet.cell(row, offset).value = value
-        sheet.cell(row, 18).value = tests
-        sheet.cell(row, 19).value = passes
+        sheet.cell(row, 18).value = tests if tests else "-"
+        sheet.cell(row, 19).value = passes if tests else "-"
         sheet.cell(row, 20).value = passes / tests if tests else "-"
+
+    _apply_row_style(sheet, right_total_row, right_total_style)
+    total_tests = sum(
+        bool(_result(record.result)) for record in rolling
+        if record.store_code in code_set and _normalise_till(record.till_type) == "Self-Scan Till"
+    )
+    total_passes = sum(
+        _result(record.result) == "pass" for record in rolling
+        if record.store_code in code_set and _normalise_till(record.till_type) == "Self-Scan Till"
+    )
+    sheet.cell(right_total_row, 18).value = total_tests if total_tests else "-"
+    sheet.cell(right_total_row, 19).value = total_passes if total_tests else "-"
+    sheet.cell(right_total_row, 20).value = total_passes / total_tests if total_tests else "-"
+
+    for row in range(right_total_row + 1, total_start):
+        _apply_row_style(sheet, row, blank_style)
     for index, label in enumerate(["Total Tests", "Total Passes", "%"]):
         row = total_start + index
+        _apply_row_style(sheet, row, bottom_styles[index])
         sheet.cell(row, 1).value = label
         sheet.cell(row, 2).value = "="
+        sheet.cell(row, 2).data_type = "s"
         for offset, month in enumerate(months, 3):
             records = [record for record in _records_in_month(rolling, month)
-                       if _normalise_till(record.till_type) == "Self-Scan Till" and _result(record.result)]
+                       if record.store_code in code_set
+                       and _normalise_till(record.till_type) == "Self-Scan Till"
+                       and _result(record.result)]
             tests = len(records)
             passes = sum(_result(record.result) == "pass" for record in records)
             sheet.cell(row, offset).value = [tests, passes, passes / tests if tests else "-"][index]
-    for table in sheet.tables.values():
-        if table.name == "Table1":
-            table.ref = f"R5:T{max(6, first_row + len(codes) - 1)}"
-        elif table.name == "Table2":
-            table.ref = f"A{total_start}:N{total_start + 2}"
+            if not tests:
+                sheet.cell(row, offset).value = "-"
+
+    right_table.ref = f"R5:T{right_total_row}"
+    right_table.totalsRowCount = 1
+    right_table.totalsRowShown = True
+    right_formulas = [
+        (
+            'COUNTIF(C6:N6,"P")+COUNTIF(C6:N6,"Fail")',
+            f"SUM(R6:R{last_store_row})",
+        ),
+        ('COUNTIF(C6:N6,"P")', f"SUM(S6:S{last_store_row})"),
+        (
+            'IF(Table1[[#This Row],[Total Tests]]=0,"-",S6/R6)',
+            f'IF(R{right_total_row}=0,"-",S{right_total_row}/R{right_total_row})',
+        ),
+    ]
+    for column, (calculated, total) in zip(right_table.tableColumns, right_formulas):
+        column.calculatedColumnFormula = TableFormula(attr_text=calculated)
+        column.totalsRowFormula = TableFormula(attr_text=total)
+        column.totalsRowFunction = "custom"
+    totals_table.ref = f"A{total_start}:N{total_end}"
+
+    sheet.conditional_formatting._cf_rules.clear()
+    sheet.conditional_formatting.add(
+        f"C6:N{last_store_row}",
+        FormulaRule(formula=['LOWER(C6)="fail"'], font=Font(color="FFFF0000")),
+    )
+    _trim_rows(sheet, total_end)
 
 
 def populate_metric_sheet(sheet, labels: list[Any], current: list[dict[str, Any]],
@@ -926,6 +1034,7 @@ def populate_regional_performance(sheet, graph_sheet, hierarchy: OrderedDict[str
                                   history: list[HistoryRecord], months: list[date],
                                   regions: list[str]) -> None:
     _strip_formulas(sheet)
+    blank_style = _snapshot_row_style(sheet, 35, 36)
     for block, block_months in [(0, months[:6]), (1, months[6:])]:
         header_row = 4 + block * 16
         date_row = 5 + block * 16
@@ -957,6 +1066,9 @@ def populate_regional_performance(sheet, graph_sheet, hierarchy: OrderedDict[str
             sheet.cell(total_row, column).value = passes
             sheet.cell(total_row, column + 1).value = fails
             sheet.cell(total_row, column + 2).value = passes / (passes + fails) * 100 if passes + fails else ""
+        for row in range(total_row + 1, data_start + 12):
+            _apply_row_style(sheet, row, blank_style)
+            _clear_values(sheet, row, row, 1, 36)
 
     sheet["F38"] = "Rolling 12 months"
     sheet["C39"] = "Region"
@@ -1012,13 +1124,22 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         sheet = workbook[name] if name in workbook.sheetnames else _copy_sheet_with_charts(workbook, template, name)
         _strip_formulas(sheet)
         stores = [store for store in hierarchy.values() if store.status == "Active" and store.region == region]
+        legacy_totals_start = _find_row(sheet, "Total Count", 1, 7) or 7
+        legacy_current_header = None
+        for row in range(7, sheet.max_row + 1):
+            if _norm(sheet.cell(row, 1).value) == "store code":
+                legacy_current_header = row
+                break
+        legacy_current_totals = _find_row(
+            sheet, "Total tests", 1, (legacy_current_header or 6) + 1
+        ) or 1
         store_end = 6 + len(stores)
-        totals_start = store_end + 2
+        totals_start = max(legacy_totals_start, store_end + 2)
         current_title_row = totals_start + 6
         current_header_row = current_title_row + 3
         current_start = current_header_row + 1
         current_end = current_start + len(stores) - 1
-        current_totals = current_end + 3
+        current_totals = max(legacy_current_totals, current_end + 3)
         needed = current_totals + 2
         _ensure_rows(sheet, needed, 7, 16)
         for merged_range in list(sheet.merged_cells.ranges):
@@ -1100,13 +1221,14 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
             row = current_totals + offset
             sheet.cell(row, 1).value = label
             sheet.cell(row, 2).value = "="
+            sheet.cell(row, 2).data_type = "s"
             sheet.cell(row, 3).value = value
             sheet.cell(row, 3).number_format = "0"
             if offset == 2:
                 sheet.cell(row, 4).value = "%"
         if sheet._charts:
             _set_chart_series(sheet._charts[0], name, 6, totals_start + 3)
-        sheet.auto_filter.ref = f"A{current_header_row}:P{max(current_header_row, current_end)}"
+        sheet.auto_filter.ref = f"A6:P{max(6, store_end)}"
     for name in list(existing):
         if name not in desired_names and name in workbook.sheetnames:
             workbook.remove(workbook[name])
@@ -1163,14 +1285,274 @@ def populate_public_reports(workbook, current: list[dict[str, Any]], history: li
     populate_performance_over_time(workbook["Performance over Time"], history, months)
 
 
+def _set_summary_formulas(workbook, current_last: int) -> None:
+    sheet = workbook["Summary Data"]
+    last = _last_data_row(sheet, 1, 8)
+    end = max(8, last)
+    sheet["B3"] = f"=COUNTA($A$8:$A${end})"
+    sheet["B4"] = f'=COUNTIF($G$8:$G${end},"PASS")+COUNTIF($G$8:$G${end},"FAIL")'
+    sheet["B5"] = '=IF($B$4=0,"-",COUNTIF($G$8:$G$%d,"PASS")/$B$4)' % end
+    sheet["X3"] = "='Checks'!$B$25"
+    formulas = [
+        "='This Period'!W{row}", "=T('This Period'!H{row})",
+        "=T('This Period'!M{row})", "='This Period'!Q{row}",
+        "='This Period'!IL{row}", "='This Period'!R{row}",
+        "=UPPER('This Period'!T{row})", "=T('This Period'!AG{row})",
+        "=T('This Period'!AH{row})", "=T('This Period'!AI{row})",
+        "=T('This Period'!AJ{row})", "=T('This Period'!AK{row})",
+        "=T('This Period'!AL{row})", "=T('This Period'!AN{row})",
+        "=T('This Period'!AO{row})", "=T('This Period'!AP{row})",
+        "=T('This Period'!AQ{row})", "='This Period'!AR{row}",
+        "=T('This Period'!AX{row})", "='This Period'!AZ{row}",
+        "='This Period'!BE{row}", "=T('This Period'!BG{row})",
+        "=T('This Period'!BD{row})", "=T('This Period'!BF{row})",
+    ]
+    for target_row, source_row in zip(range(8, last + 1), range(4, current_last + 1)):
+        for column, formula in enumerate(formulas, 1):
+            sheet.cell(target_row, column).value = formula.format(row=source_row)
+
+
+def _set_historic_formulas(workbook, cumulative_last: int) -> None:
+    sheet = workbook["Historic Data"]
+    last = _last_data_row(sheet, 1, 4)
+    for row, source_row in zip(range(4, last + 1), range(4, cumulative_last + 1)):
+        sheet.cell(row, 1).value = f"='Cumulative'!V{source_row}"
+        sheet.cell(row, 2).value = f'=IFERROR(VLOOKUP(A{row},\'StoreList\'!$A:$B,2,FALSE),"")'
+        sheet.cell(row, 3).value = f"='Cumulative'!K{source_row}"
+        sheet.cell(row, 4).value = f"='Cumulative'!P{source_row}"
+        sheet.cell(row, 5).value = f"=UPPER('Cumulative'!S{source_row})"
+
+
+def _set_store_performance_formulas(workbook, current_last: int, ytd_last: int) -> None:
+    sheet = workbook["Store Performance"]
+    total_row = _find_row(sheet, "Total", 1, 7)
+    if total_row is None:
+        return
+    last_store = total_row - 2
+    for row in range(7, last_store + 1):
+        current_key = f"'This Period'!$IR$4:$IV${max(4, current_last)}"
+        ytd_key = f"'YTD'!$IV$4:$IV${max(4, ytd_last)}"
+        sheet.cell(row, 3).value = f'=COUNTIF({current_key},$A{row}&"PASS")+COUNTIF({current_key},$A{row}&"FAIL")+COUNTIF({current_key},$A{row}&"ABORT")'
+        sheet.cell(row, 4).value = f'=COUNTIF({current_key},$A{row}&"PASS")+COUNTIF({current_key},$A{row}&"FAIL")'
+        sheet.cell(row, 5).value = f'=COUNTIF({current_key},$A{row}&"FAIL")'
+        sheet.cell(row, 6).value = f'=COUNTIF({current_key},$A{row}&"PASS")'
+        sheet.cell(row, 7).value = f'=IF(D{row}=0,"-",F{row}/D{row})'
+        sheet.cell(row, 8).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")+COUNTIF({ytd_key},$A{row}&"FAIL")+COUNTIF({ytd_key},$A{row}&"ABORT")'
+        sheet.cell(row, 9).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")+COUNTIF({ytd_key},$A{row}&"FAIL")'
+        sheet.cell(row, 10).value = f'=COUNTIF({ytd_key},$A{row}&"FAIL")'
+        sheet.cell(row, 11).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")'
+        sheet.cell(row, 12).value = f'=IF(I{row}=0,"-",K{row}/I{row})'
+    for column in [3, 4, 5, 6, 8, 9, 10, 11]:
+        letter = get_column_letter(column)
+        sheet.cell(total_row, column).value = f"=SUM({letter}7:{letter}{last_store})"
+    sheet.cell(total_row, 7).value = f'=IF(D{total_row}=0,"-",F{total_row}/D{total_row})'
+    sheet.cell(total_row, 12).value = f'=IF(I{total_row}=0,"-",K{total_row}/I{total_row})'
+
+    league = workbook["Store Performance (2)"]
+    last = _last_data_row(league, 1, 6)
+    key = f"'YTD'!$IV$4:$IV${max(4, ytd_last)}"
+    for row in range(6, last + 1):
+        league.cell(row, 3).value = f'=COUNTIF({key},$A{row}&"FAIL")'
+
+
+def _set_self_scan_formulas(workbook, cumulative_last: int) -> None:
+    sheet = workbook["Self-Scan Performance"]
+    right_table = next((table for table in sheet.tables.values() if table.name == "Table1"), None)
+    totals_table = next((table for table in sheet.tables.values() if table.name == "Table2"), None)
+    if right_table is None or totals_table is None:
+        return
+    _, _, _, right_total = range_boundaries(right_table.ref)
+    last_store = right_total - 1
+    _, total_start, _, total_end = range_boundaries(totals_table.ref)
+    for offset, column in enumerate(range(3, 15), 18):
+        letter = get_column_letter(column)
+        sheet.cell(4, column).value = f"='Input'!$A${offset}"
+        sheet.cell(5, column).value = f"='Input'!$B${offset}"
+        for row in range(6, last_store + 1):
+            sheet.cell(row, column).value = (
+                f'=IFERROR(VLOOKUP($A{row}&{letter}$4,\'Cumulative\'!$IB$4:$IC${max(4, cumulative_last)},2,FALSE),"-")'
+            )
+    for row in range(6, last_store + 1):
+        sheet.cell(row, 18).value = f'=IF(COUNTIF(C{row}:N{row},"P")+COUNTIF(C{row}:N{row},"Fail")=0,"-",COUNTIF(C{row}:N{row},"P")+COUNTIF(C{row}:N{row},"Fail"))'
+        sheet.cell(row, 19).value = f'=IF(R{row}="-","-",COUNTIF(C{row}:N{row},"P"))'
+        sheet.cell(row, 20).value = f'=IF(R{row}="-","-",S{row}/R{row})'
+    sheet.cell(right_total, 18).value = f'=IF(SUM(R6:R{last_store})=0,"-",SUM(R6:R{last_store}))'
+    sheet.cell(right_total, 19).value = f'=IF(R{right_total}="-","-",SUM(S6:S{last_store}))'
+    sheet.cell(right_total, 20).value = f'=IF(R{right_total}="-","-",S{right_total}/R{right_total})'
+    for column in range(3, 15):
+        letter = get_column_letter(column)
+        sheet.cell(total_start, column).value = f'=IF(COUNTIF({letter}6:{letter}{last_store},"P")+COUNTIF({letter}6:{letter}{last_store},"Fail")=0,"-",COUNTIF({letter}6:{letter}{last_store},"P")+COUNTIF({letter}6:{letter}{last_store},"Fail"))'
+        sheet.cell(total_start + 1, column).value = f'=IF({letter}{total_start}="-","-",COUNTIF({letter}6:{letter}{last_store},"P"))'
+        sheet.cell(total_start + 2, column).value = f'=IF({letter}{total_start}="-","-",{letter}{total_start + 1}/{letter}{total_start})'
+
+
+def _set_metric_formulas(workbook, current_last: int, ytd_last: int) -> None:
+    helpers = {
+        "Postcode Performance": ("IQ", "IU"),
+        "Till Type Performance": ("IE", "IE"),
+        "Day of Week Performance": ("IO", "IS"),
+        "Time of Day Performance": ("IJ", "IL"),
+    }
+    for name, (current_helper, ytd_helper) in helpers.items():
+        sheet = workbook[name]
+        total_row = _find_row(sheet, "Total", 1, 7)
+        if total_row is None:
+            continue
+        last_label = total_row - 2
+        current_key = f"'This Period'!${current_helper}$4:${current_helper}${max(4, current_last)}"
+        ytd_key = f"'YTD'!${ytd_helper}$4:${ytd_helper}${max(4, ytd_last)}"
+        for row in range(7, last_label + 1):
+            sheet.cell(row, 2).value = f'=COUNTIF({current_key},$A{row}&"PASS")+COUNTIF({current_key},$A{row}&"FAIL")+COUNTIF({current_key},$A{row}&"ABORT")'
+            sheet.cell(row, 3).value = f'=COUNTIF({current_key},$A{row}&"PASS")+COUNTIF({current_key},$A{row}&"FAIL")'
+            sheet.cell(row, 4).value = f'=COUNTIF({current_key},$A{row}&"FAIL")'
+            sheet.cell(row, 5).value = f'=COUNTIF({current_key},$A{row}&"PASS")'
+            sheet.cell(row, 6).value = f'=IF(C{row}=0,"-",E{row}/C{row})'
+            sheet.cell(row, 7).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")+COUNTIF({ytd_key},$A{row}&"FAIL")+COUNTIF({ytd_key},$A{row}&"ABORT")'
+            sheet.cell(row, 8).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")+COUNTIF({ytd_key},$A{row}&"FAIL")'
+            sheet.cell(row, 9).value = f'=COUNTIF({ytd_key},$A{row}&"FAIL")'
+            sheet.cell(row, 10).value = f'=COUNTIF({ytd_key},$A{row}&"PASS")'
+            sheet.cell(row, 11).value = f'=IF(H{row}=0,"-",J{row}/H{row})'
+        for column in [2, 3, 4, 5, 7, 8, 9, 10]:
+            letter = get_column_letter(column)
+            sheet.cell(total_row, column).value = f"=SUM({letter}7:{letter}{last_label})"
+        sheet.cell(total_row, 6).value = f'=IF(C{total_row}=0,"-",E{total_row}/C{total_row})'
+        sheet.cell(total_row, 11).value = f'=IF(H{total_row}=0,"-",J{total_row}/H{total_row})'
+
+
+def _set_regional_formulas(workbook, cumulative_last: int, regions: list[str]) -> None:
+    sheet = workbook["Regional Performance"]
+    region_rows: dict[int, list[int]] = {}
+    for block, data_start in [(0, 7), (1, 23)]:
+        header_row = 4 + block * 16
+        rows = list(range(data_start, data_start + len(regions)))
+        region_rows[block] = rows
+        total_row = data_start + len(regions)
+        for row in rows:
+            for column in range(5, 23, 3):
+                pass_letter = get_column_letter(column)
+                fail_letter = get_column_letter(column + 1)
+                sheet.cell(row, column).value = f'=COUNTIF(\'Cumulative\'!$IH$4:$IH${max(4, cumulative_last)},$D{row}&{pass_letter}${header_row}&{pass_letter}$6)'
+                sheet.cell(row, column + 1).value = f'=COUNTIF(\'Cumulative\'!$IH$4:$IH${max(4, cumulative_last)},$D{row}&{pass_letter}${header_row}&{fail_letter}$6)'
+                sheet.cell(row, column + 2).value = f'=IF(SUM({pass_letter}{row}:{fail_letter}{row})=0,"",{pass_letter}{row}/SUM({pass_letter}{row}:{fail_letter}{row})*100)'
+        for column in range(5, 23, 3):
+            pass_letter = get_column_letter(column)
+            fail_letter = get_column_letter(column + 1)
+            rate_letter = get_column_letter(column + 2)
+            sheet.cell(total_row, column).value = f"=SUM({pass_letter}{data_start}:{pass_letter}{total_row - 1})"
+            sheet.cell(total_row, column + 1).value = f"=SUM({fail_letter}{data_start}:{fail_letter}{total_row - 1})"
+            sheet.cell(total_row, column + 2).value = f'=IF(SUM({pass_letter}{total_row}:{fail_letter}{total_row})=0,"",{pass_letter}{total_row}/SUM({pass_letter}{total_row}:{fail_letter}{total_row})*100)'
+    for index, region in enumerate(regions, 4):
+        first_row = 7 + regions.index(region)
+        second_row = 23 + regions.index(region)
+        pass_cells = [f"{get_column_letter(column)}{row}" for row in [first_row, second_row] for column in range(5, 23, 3)]
+        fail_cells = [f"{get_column_letter(column)}{row}" for row in [first_row, second_row] for column in range(6, 23, 3)]
+        pass_sum = "+".join(pass_cells)
+        fail_sum = "+".join(fail_cells)
+        sheet.cell(40, index).value = f'=IF(({pass_sum}+{fail_sum})=0,"",({pass_sum})/({pass_sum}+{fail_sum}))'
+
+
+def _set_region_formulas(workbook, current_last: int, cumulative_last: int,
+                         regions: list[str]) -> None:
+    for region in regions:
+        sheet = workbook[f"Region {region}"]
+        totals_start = _find_row(sheet, "Total Count", 1, 7)
+        current_header = None
+        for row in range((totals_start or 7) + 4, sheet.max_row + 1):
+            if _norm(sheet.cell(row, 1).value) == "store code":
+                current_header = row
+                break
+        current_totals = _find_row(sheet, "Total tests", 1, (current_header or 6) + 1)
+        if totals_start is None or current_header is None or current_totals is None:
+            continue
+        sheet["C3"] = '="External Test Purchases "&\'Checks\'!$B$26'
+        current_title_row = current_header - 3
+        sheet.cell(current_title_row, 3).value = '="External Test Purchases "&\'Checks\'!$B$26'
+        for offset, column in enumerate(range(5, 17), 18):
+            letter = get_column_letter(column)
+            sheet.cell(5, column).value = f"='Input'!$A${offset}"
+            sheet.cell(6, column).value = f"='Input'!$B${offset}"
+        upper_rows = [row for row in range(7, totals_start) if sheet.cell(row, 1).value not in (None, "")]
+        for row in upper_rows:
+            sheet.cell(row, 4).value = f'=COUNTIF(E{row}:P{row},"Fail")'
+            for column in range(5, 17):
+                letter = get_column_letter(column)
+                sheet.cell(row, column).value = f'=IFERROR(VLOOKUP($A{row}&{letter}$5,\'Cumulative\'!$IF$4:$IL${max(4, cumulative_last)},2,FALSE),"-")'
+        last_upper = upper_rows[-1] if upper_rows else 6
+        for index in range(4):
+            row = totals_start + index
+            for column in range(5, 17):
+                letter = get_column_letter(column)
+                if index == 0:
+                    formula = f'=COUNTIF({letter}7:{letter}{last_upper},"P")+COUNTIF({letter}7:{letter}{last_upper},"Fail")'
+                elif index == 1:
+                    formula = f'=COUNTIF({letter}7:{letter}{last_upper},"P")'
+                elif index == 2:
+                    formula = f'=COUNTIF({letter}7:{letter}{last_upper},"Fail")'
+                else:
+                    formula = f'=IF({letter}{totals_start}=0,"",{letter}{totals_start + 1}/{letter}{totals_start}*100)'
+                sheet.cell(row, column).value = formula
+        lower_rows = [
+            row for row in range(current_header + 1, current_totals)
+            if sheet.cell(row, 1).value not in (None, "")
+        ]
+        for row in lower_rows:
+            sheet.cell(row, 3).value = f'=IFERROR(VLOOKUP($A{row},\'This Period\'!$A$4:$Q${max(4, current_last)},17,FALSE),"-")'
+            sheet.cell(row, 4).value = f'=IFERROR(VLOOKUP($A{row},\'This Period\'!$A$4:$R${max(4, current_last)},18,FALSE),"-")'
+            sheet.cell(row, 6).value = f'=IFERROR(VLOOKUP($A{row},\'This Period\'!$A$4:$IG${max(4, current_last)},241,FALSE),"-")'
+        last_lower = lower_rows[-1] if lower_rows else current_header
+        sheet.cell(current_totals, 3).value = f'=COUNTIF(F{current_header + 1}:F{last_lower},"P")+COUNTIF(F{current_header + 1}:F{last_lower},"Fail")'
+        sheet.cell(current_totals + 1, 3).value = f'=COUNTIF(F{current_header + 1}:F{last_lower},"P")'
+        sheet.cell(current_totals + 2, 3).value = f'=IF(C{current_totals}=0,"-",C{current_totals + 1}/C{current_totals}*100)'
+
+
+def _set_performance_over_time_formulas(workbook, regions: list[str]) -> None:
+    sheet = workbook["Performance over Time"]
+    totals = [7 + len(regions), 23 + len(regions)]
+    for index, column in enumerate(range(2, 14)):
+        input_row = 18 + index
+        block = 0 if index < 6 else 1
+        metric_column = 5 + (index % 6) * 3
+        pass_letter = get_column_letter(metric_column)
+        fail_letter = get_column_letter(metric_column + 1)
+        total_row = totals[block]
+        sheet.cell(5, column).value = f'=TEXT(\'Input\'!$B${input_row},"mmm yyyy")'
+        sheet.cell(6, column).value = f'=IF((\'Regional Performance\'!{pass_letter}{total_row}+\'Regional Performance\'!{fail_letter}{total_row})=0,"-",\'Regional Performance\'!{pass_letter}{total_row}/(\'Regional Performance\'!{pass_letter}{total_row}+\'Regional Performance\'!{fail_letter}{total_row}))'
+
+
+def apply_public_formulas(workbook, current_last: int, cumulative_last: int,
+                          ytd_last: int, regions: list[str]) -> None:
+    """Restore the formula-driven public tabs used by the internal LIVE file."""
+    _set_summary_formulas(workbook, current_last)
+    _set_historic_formulas(workbook, cumulative_last)
+    _set_store_performance_formulas(workbook, current_last, ytd_last)
+    _set_self_scan_formulas(workbook, cumulative_last)
+    _set_metric_formulas(workbook, current_last, ytd_last)
+    _set_regional_formulas(workbook, cumulative_last, regions)
+    _set_region_formulas(workbook, current_last, cumulative_last, regions)
+    _set_performance_over_time_formulas(workbook, regions)
+
+
 def _remove_invalid_names(workbook, removed_sheets: set[str] | None = None) -> None:
     removed_sheets = removed_sheets or set()
-    for name, defined_name in list(workbook.defined_names.items()):
-        reference = _text(getattr(defined_name, "attr_text", ""))
-        if "#REF!" in reference or re.search(r"\[\d+\]", reference) or any(
-            f"'{sheet}'!" in reference or f"{sheet}!" in reference for sheet in removed_sheets
-        ):
-            del workbook.defined_names[name]
+    containers = [workbook.defined_names]
+    containers.extend(sheet.defined_names for sheet in workbook.worksheets)
+    for container in containers:
+        for name, defined_name in list(container.items()):
+            reference = _text(getattr(defined_name, "attr_text", ""))
+            if "#REF!" in reference or re.search(r"\[\d+\]", reference) or any(
+                f"'{sheet}'!" in reference or f"{sheet}!" in reference for sheet in removed_sheets
+            ):
+                del container[name]
+
+
+def _strip_table_formulas(workbook) -> None:
+    """Keep the non-LIVE report genuinely values-only, including table metadata."""
+    for sheet in workbook.worksheets:
+        for table in sheet.tables.values():
+            for column in table.tableColumns:
+                column.calculatedColumnFormula = None
+                column.totalsRowFormula = None
+                column.totalsRowFunction = None
 
 
 def _remove_invalid_formulas(workbook) -> None:
@@ -1222,11 +1604,9 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes,
     workbook._external_links = []
     _remove_invalid_formulas(workbook)
     _remove_invalid_names(workbook)
-    _select_sheet(workbook, "This Period")
-    live_bytes = _save(workbook)
-    workbook.close()
+    static_bytes = _save(workbook)
 
-    client = load_workbook(io.BytesIO(live_bytes), data_only=False, keep_links=False)
+    client = load_workbook(io.BytesIO(static_bytes), data_only=False, keep_links=False)
     public_sheets = set(PUBLIC_BASE_SHEETS) | {f"Region {region}" for region in regions}
     removed = {name for name in client.sheetnames if name not in public_sheets}
     for name in list(client.sheetnames):
@@ -1234,11 +1614,19 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes,
             client.remove(client[name])
     for sheet in client.worksheets:
         _strip_formulas(sheet)
+    _strip_table_formulas(client)
     client._external_links = []
     _remove_invalid_names(client, removed)
     _select_sheet(client, "Summary Data")
     client_bytes = _save(client)
     client.close()
+
+    apply_public_formulas(workbook, current_last, cumulative_last, ytd_last, regions)
+    _remove_invalid_formulas(workbook)
+    _remove_invalid_names(workbook)
+    _select_sheet(workbook, "This Period")
+    live_bytes = _save(workbook)
+    workbook.close()
 
     completed = [record for record in current if _result(record["result"])]
     current_passes = sum(_result(record["result"]) == "pass" for record in completed)
