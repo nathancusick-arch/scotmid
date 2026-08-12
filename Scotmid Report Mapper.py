@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import TableFormula
 
 
-GENERATOR_VERSION = "2026.08.12.3"
+GENERATOR_VERSION = "2026.08.12.4"
 COMPANY_NAME = "Scotmid Co-operative"
 
 
@@ -1115,6 +1115,73 @@ def _set_chart_series(chart, sheet_name: str, category_row: int, value_row: int)
     series.val.numRef.f = f"'{sheet_name}'!$E${value_row}:$P${value_row}"
 
 
+def _remap_region_layout_metadata(sheet, legacy_store_end: int, store_end: int,
+                                  legacy_current_end: int, current_end: int,
+                                  conditional_formats: list[tuple[str, list[Any]]]) -> None:
+    """Move pagination, drawings and conditional formatting with dynamic region rows."""
+    upper_delta = store_end - legacy_store_end
+    lower_delta = current_end - legacy_current_end - upper_delta
+
+    def map_row(row: int) -> int:
+        if row < legacy_store_end:
+            return row
+        if row == legacy_store_end:
+            return store_end
+        if row < legacy_current_end:
+            return row + upper_delta
+        if row == legacy_current_end:
+            return current_end
+        return row + upper_delta + lower_delta
+
+    def map_range(reference: str) -> str:
+        min_col, min_row, max_col, max_row = range_boundaries(reference)
+        return (
+            f"{get_column_letter(min_col)}{map_row(min_row)}:"
+            f"{get_column_letter(max_col)}{map_row(max_row)}"
+        )
+
+    sheet.conditional_formatting._cf_rules.clear()
+    for references, rules in conditional_formats:
+        old_ranges = references.split()
+        new_ranges = [map_range(reference) for reference in old_ranges]
+        old_min_col, old_min_row, _, _ = range_boundaries(old_ranges[0])
+        new_min_col, new_min_row, _, _ = range_boundaries(new_ranges[0])
+        old_origin = f"{get_column_letter(old_min_col)}{old_min_row}"
+        new_origin = f"{get_column_letter(new_min_col)}{new_min_row}"
+        for rule in rules:
+            remapped = copy(rule)
+            if remapped.formula:
+                formulas = []
+                for formula in remapped.formula:
+                    try:
+                        translated = Translator(
+                            f"={formula}", origin=old_origin
+                        ).translate_formula(new_origin)
+                        formulas.append(translated[1:])
+                    except (TypeError, ValueError):
+                        formulas.append(formula)
+                remapped.formula = formulas
+            sheet.conditional_formatting.add(" ".join(new_ranges), remapped)
+
+    for page_break in sheet.row_breaks.brk:
+        page_break.id = map_row(page_break.id)
+
+    print_reference = _text(sheet.print_area)
+    match = re.search(r"\$([A-Z]+)\$(\d+):\$([A-Z]+)\$(\d+)$", print_reference)
+    if match:
+        sheet.print_area = (
+            f"${match.group(1)}${map_row(int(match.group(2)))}:"
+            f"${match.group(3)}${map_row(int(match.group(4)))}"
+        )
+
+    for chart in sheet._charts:
+        anchor = chart.anchor
+        if hasattr(anchor, "_from"):
+            anchor._from.row = map_row(anchor._from.row)
+        if hasattr(anchor, "to"):
+            anchor.to.row = map_row(anchor.to.row)
+
+
 def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history: list[HistoryRecord],
                            current: list[dict[str, Any]], months: list[date],
                            regions: list[str], report_month: date) -> None:
@@ -1137,6 +1204,12 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         legacy_current_totals = _find_row(
             sheet, "Total tests", 1, (legacy_current_header or 6) + 1
         ) or 1
+        legacy_store_end = max(6, legacy_totals_start - 2)
+        legacy_current_end = max(legacy_current_header or 6, legacy_current_totals - 3)
+        conditional_formats = [
+            (str(item.sqref), [copy(rule) for rule in item.rules])
+            for item in sheet.conditional_formatting
+        ]
         upper_gap_style = _snapshot_row_style(sheet, max(7, legacy_totals_start - 1), 16)
         upper_total_styles = [
             _snapshot_row_style(sheet, legacy_totals_start + offset, 16)
@@ -1179,6 +1252,8 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         _apply_row_style(sheet, store_end + 1, upper_gap_style)
         for offset, snapshot in enumerate(upper_total_styles):
             _apply_row_style(sheet, totals_start + offset, snapshot)
+        for row in range(totals_start + 4, current_title_row):
+            _apply_row_style(sheet, row, current_blank_style)
         _apply_row_style(sheet, current_title_row, current_title_style)
         _apply_row_style(sheet, current_title_row + 1, current_region_style)
         _apply_row_style(sheet, current_title_row + 2, current_blank_style)
@@ -1265,6 +1340,10 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         if sheet._charts:
             _set_chart_series(sheet._charts[0], name, 6, totals_start + 3)
         sheet.auto_filter.ref = f"A6:P{max(6, store_end)}"
+        _remap_region_layout_metadata(
+            sheet, legacy_store_end, store_end, legacy_current_end, current_end,
+            conditional_formats,
+        )
         _trim_rows(sheet, needed)
     for name in list(existing):
         if name not in desired_names and name in workbook.sheetnames:
