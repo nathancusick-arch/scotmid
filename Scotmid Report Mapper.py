@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import TableFormula
 
 
-GENERATOR_VERSION = "2026.08.12.2"
+GENERATOR_VERSION = "2026.08.12.3"
 COMPANY_NAME = "Scotmid Co-operative"
 
 
@@ -791,7 +791,11 @@ def populate_store_performance(sheet, league_sheet, hierarchy: OrderedDict[str, 
                                report_month: date) -> int:
     _strip_formulas(sheet)
     _strip_formulas(league_sheet)
-    stores = list(hierarchy.values())
+    ytd_codes = {record.store_code for record in ytd}
+    stores = [
+        store for code, store in hierarchy.items()
+        if store.status == "Active" or code in ytd_codes
+    ]
     old_total_row = _find_row(sheet, "Total", 1, 7) or sheet.max_row
     store_style = _snapshot_row_style(sheet, 7, 12)
     gap_style = _snapshot_row_style(sheet, max(7, old_total_row - 1), 12)
@@ -994,7 +998,7 @@ def populate_metric_sheet(sheet, labels: list[Any], current: list[dict[str, Any]
 
 def _postcode_region(value: Any) -> str:
     match = re.match(r"([A-Z]{1,2})", _text(value).upper())
-    return match.group(1) if match else "Other"
+    return match.group(1) if match else ""
 
 
 def _day_label(value: Any) -> str:
@@ -1133,13 +1137,32 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         legacy_current_totals = _find_row(
             sheet, "Total tests", 1, (legacy_current_header or 6) + 1
         ) or 1
+        upper_gap_style = _snapshot_row_style(sheet, max(7, legacy_totals_start - 1), 16)
+        upper_total_styles = [
+            _snapshot_row_style(sheet, legacy_totals_start + offset, 16)
+            for offset in range(4)
+        ]
+        legacy_current_title = max(1, (legacy_current_header or 4) - 3)
+        current_title_style = _snapshot_row_style(sheet, legacy_current_title, 16)
+        current_region_style = _snapshot_row_style(sheet, legacy_current_title + 1, 16)
+        current_blank_style = _snapshot_row_style(sheet, legacy_current_title + 2, 16)
+        current_header_style = _snapshot_row_style(sheet, legacy_current_header or 6, 16)
+        current_data_style = _snapshot_row_style(sheet, (legacy_current_header or 6) + 1, 16)
+        current_gap_styles = [
+            _snapshot_row_style(sheet, max(1, legacy_current_totals - 2 + offset), 16)
+            for offset in range(2)
+        ]
+        current_total_styles = [
+            _snapshot_row_style(sheet, legacy_current_totals + offset, 16)
+            for offset in range(3)
+        ]
         store_end = 6 + len(stores)
-        totals_start = max(legacy_totals_start, store_end + 2)
+        totals_start = store_end + 2
         current_title_row = totals_start + 6
         current_header_row = current_title_row + 3
         current_start = current_header_row + 1
         current_end = current_start + len(stores) - 1
-        current_totals = max(legacy_current_totals, current_end + 3)
+        current_totals = current_end + 3
         needed = current_totals + 2
         _ensure_rows(sheet, needed, 7, 16)
         for merged_range in list(sheet.merged_cells.ranges):
@@ -1153,6 +1176,19 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
             sheet.merge_cells(start_row=merged_row, start_column=9,
                               end_row=merged_row, end_column=11)
         _clear_values(sheet, 3, max(sheet.max_row, needed), 1, 16)
+        _apply_row_style(sheet, store_end + 1, upper_gap_style)
+        for offset, snapshot in enumerate(upper_total_styles):
+            _apply_row_style(sheet, totals_start + offset, snapshot)
+        _apply_row_style(sheet, current_title_row, current_title_style)
+        _apply_row_style(sheet, current_title_row + 1, current_region_style)
+        _apply_row_style(sheet, current_title_row + 2, current_blank_style)
+        _apply_row_style(sheet, current_header_row, current_header_style)
+        for row in range(current_start, current_end + 1):
+            _apply_row_style(sheet, row, current_data_style)
+        for offset, snapshot in enumerate(current_gap_styles):
+            _apply_row_style(sheet, current_end + 1 + offset, snapshot)
+        for offset, snapshot in enumerate(current_total_styles):
+            _apply_row_style(sheet, current_totals + offset, snapshot)
         sheet["A3"] = name
         sheet["C3"] = f"External Test Purchases {report_month:%B %Y}"
         for offset, month in enumerate(months, 5):
@@ -1229,6 +1265,7 @@ def populate_region_sheets(workbook, hierarchy: OrderedDict[str, Store], history
         if sheet._charts:
             _set_chart_series(sheet._charts[0], name, 6, totals_start + 3)
         sheet.auto_filter.ref = f"A6:P{max(6, store_end)}"
+        _trim_rows(sheet, needed)
     for name in list(existing):
         if name not in desired_names and name in workbook.sheetnames:
             workbook.remove(workbook[name])
@@ -1257,7 +1294,8 @@ def populate_public_reports(workbook, current: list[dict[str, Any]], history: li
     ]
     observed = {_postcode_region(record["postcode"]) for record in current}
     observed.update(_postcode_region(record.postcode) for record in ytd)
-    postcode_labels = [label for label in existing_postcodes if label in observed]
+    observed.discard("")
+    postcode_labels = list(dict.fromkeys(existing_postcodes))
     postcode_labels.extend(sorted(observed - set(postcode_labels)))
     populate_metric_sheet(
         workbook["Postcode Performance"], postcode_labels, current, ytd,
@@ -1549,10 +1587,17 @@ def _strip_table_formulas(workbook) -> None:
     """Keep the non-LIVE report genuinely values-only, including table metadata."""
     for sheet in workbook.worksheets:
         for table in sheet.tables.values():
+            had_totals_row = bool(table.totalsRowCount or table.totalsRowShown) or any(
+                column.totalsRowFormula is not None or column.totalsRowFunction is not None
+                for column in table.tableColumns
+            )
             for column in table.tableColumns:
                 column.calculatedColumnFormula = None
                 column.totalsRowFormula = None
                 column.totalsRowFunction = None
+            if had_totals_row:
+                table.totalsRowCount = None
+                table.totalsRowShown = None
 
 
 def _remove_invalid_formulas(workbook) -> None:
