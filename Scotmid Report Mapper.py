@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import TableFormula
 
 
-GENERATOR_VERSION = "2026.08.12.4"
+GENERATOR_VERSION = "2026.10.08.1"
 COMPANY_NAME = "Scotmid Co-operative"
 
 
@@ -310,12 +310,31 @@ def _increment_order_id(value: Any) -> str:
     return f"{match.group(1)}{int(match.group(2)) + 1}" if match else text
 
 
+def normalise_export_headers(frame: pd.DataFrame) -> pd.DataFrame:
+    """Accept plain question titles and 'Q123 - Question title' headers.
+
+    Different question IDs can share a title across surveys. Merge their
+    nonblank answers row by row to match the old export's single title column.
+    """
+    columns: dict[str, pd.Series] = {}
+    for position, header in enumerate(frame.columns):
+        title = re.sub(r"^Q\d+\s*-\s*", "", str(header))
+        answers = frame.iloc[:, position]
+        if title in columns:
+            blank = columns[title].isna() | columns[title].astype(str).str.strip().eq("")
+            columns[title] = columns[title].mask(blank, answers)
+        else:
+            columns[title] = answers
+    return pd.DataFrame(columns, index=frame.index)
+
+
 def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], date, str, dict[str, int], list[str]]:
     try:
         frame = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding="utf-8-sig").fillna("")
     except Exception as exc:
         raise ReportGenerationError(f"The audit export could not be read as CSV: {exc}") from exc
 
+    frame = normalise_export_headers(frame)
     required = {"item_to_order", "primary_result", "date_of_visit", "internal_id", "site_code"}
     missing = sorted(required - set(frame.columns))
     if missing:
